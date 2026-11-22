@@ -28,11 +28,11 @@ class UserResponse(SQLModel):
     role: str
 
 
-class PasswordRestRequest(SQLModel):
+class PasswordResetRequest(SQLModel):
     email: EmailStr
 
 
-class PasswordResteToken(SQLModel, table=True):
+class PasswordResetToken(SQLModel, table=True):
     __tablename__: str = "password_reset_tokens"
 
     id: int | None = Field(default=None, primary_key=True)
@@ -40,3 +40,8 @@ class PasswordResteToken(SQLModel, table=True):
     token: str = Field(unique=True, index=True)
     expires_at: datetime
     used: bool = Field(default=False)
+
+
+class PasswordResetConfirm(SQLModel):
+    token: str
+    new_password: str = Field(min_length=8, max_length=16)

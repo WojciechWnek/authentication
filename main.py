@@ -1,6 +1,6 @@
 import secrets
 from contextlib import asynccontextmanager
-from datetime import UTC, timedelta
+from datetime import UTC, datetime, timedelta
 from typing import Annotated
 
 from fastapi import APIRouter, Body, Depends, FastAPI, HTTPException, status
@@ -9,8 +9,9 @@ from sqlmodel import select
 
 from database import SessionDep, create_db_and_tables
 from models import (
-    PasswordResteToken,
-    PasswordRestRequest,
+    PasswordResetConfirm,
+    PasswordResetRequest,
+    PasswordResetToken,
     User,
     UserCreate,
     UserResponse,
@@ -34,17 +35,18 @@ async def lifespan(app: FastAPI):
     yield
 
 
-invalid_token_exception = HTTPException(
-    status_code=status.HTTP_401_UNAUTHORIZED,
-    detail="Invalid token",
-    headers={"WWW-Authenticate": "Bearer"},
-)
 app = FastAPI(lifespan=lifespan)
 
 
 def get_current_user(
     session: SessionDep, token: Annotated[str, Depends(oauth2_scheme)]
 ):
+    invalid_token_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Invalid token",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+
     payload = decode_token(token)
     if not payload:
         raise invalid_token_exception
@@ -71,6 +73,7 @@ def register(session: SessionDep, user_data: UserCreate):
     existing_user = session.exec(
         select(User).where(User.email == user_data.email)
     ).first()
+
     if existing_user:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST, detail="Email already registered"
@@ -87,7 +90,7 @@ def register(session: SessionDep, user_data: UserCreate):
     return new_user
 
 
-@app.post("/token", status_code=status.HTTP_200_OK)
+@app.post("/token")
 def login(
     session: SessionDep, form_data: Annotated[OAuth2PasswordRequestForm, Depends()]
 ):
@@ -95,22 +98,20 @@ def login(
         select(User).where(User.email == form_data.username)
     ).first()
 
-    credential_exception = HTTPException(
+    credentials_exception = HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
         detail="Invalid credentials",
         headers={"WWW-Authenticate": "Bearer"},
     )
 
     if not existing_user:
-        # Deceive hacker with timimg needed to hash the password
         verify_password(form_data.password, DUMMY_HASH)
-        raise credential_exception
+        raise credentials_exception
 
     if not verify_password(form_data.password, existing_user.hashed_password):
-        raise credential_exception
+        raise credentials_exception
 
     data = {"sub": existing_user.email}
-
     access_token = create_access_token(data=data)
     refresh_token = create_refresh_token(data=data)
 
@@ -123,8 +124,11 @@ def login(
 
 @app.post("/token/refresh")
 def refresh_token(session: SessionDep, refresh_token: Annotated[str, Body(embed=True)]):
-    payload = decode_token(refresh_token)
+    invalid_token_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token"
+    )
 
+    payload = decode_token(refresh_token)
     if not payload:
         raise invalid_token_exception
 
@@ -140,13 +144,10 @@ def refresh_token(session: SessionDep, refresh_token: Annotated[str, Body(embed=
         raise invalid_token_exception
 
     new_access_token = create_access_token(data={"sub": user.email})
-    return {
-        "access_token": new_access_token,
-        "token_type": "bearer",
-    }
+    return {"access_token": new_access_token, "token_type": "bearer"}
 
 
-user_router = APIRouter(tags=["users"], dependencies=[Depends(get_current_user)])
+user_router = APIRouter(dependencies=[Depends(get_current_user)], tags=["users"])
 
 
 @user_router.get("/me", status_code=status.HTTP_200_OK, response_model=UserResponse)
@@ -154,11 +155,10 @@ def get_me(current_user: CurrentUser):
     return current_user
 
 
-@user_router.patch("/me", status_code=status.HTTP_200_OK, response_model=UserResponse)
+@user_router.patch("/me", response_model=UserResponse)
 def update_me(
     session: SessionDep, current_user: CurrentUser, update_payload: UserUpdate
 ):
-
     if not update_payload.email:
         return current_user
 
@@ -174,7 +174,6 @@ def update_me(
     current_user.email = update_payload.email
 
     session.add(current_user)
-
     session.commit()
     session.refresh(current_user)
 
@@ -183,31 +182,71 @@ def update_me(
 
 @user_router.get("/dashboard")
 def dashboard():
-    return {"profit": 1000000}
+    return {"Profit": 1_000_000}
 
 
 app.include_router(user_router)
 
 
-@app.post("/passwor-reset/request")
-def requeest_password_reset(session: SessionDep, payload: PasswordRestRequest):
-    messsage = {"message": "If exists, reset email sent."}
+@app.post("/password-reset/request")
+def request_password_reset(session: SessionDep, payload: PasswordResetRequest):
+    message = {
+        "message": "If an account exists with this email, a reset link has been sent"
+    }
 
     user = session.exec(select(User).where(User.email == payload.email)).first()
 
     if not user or not user.id:
-        return messsage
+        return message
 
     token = secrets.token_urlsafe(32)
 
-    reset_token = PasswordResteToken(
+    reset_token = PasswordResetToken(
         token=token,
         user_id=user.id,
-        expires_at=dashboard.now(UTC) + timedelta(minutes=10),
+        expires_at=datetime.now(UTC) + timedelta(minutes=10),
         used=False,
     )
-
     session.add(reset_token)
     session.commit()
+    # In production: send an email to the user with the contents of token
+    # Here's the link to you reset your password
+    # i.e. send_reset_email(user.email, token)
 
-    return messsage
+    return message
+
+
+@app.post("/password-reset/confirm")
+def confirm_password_reset(session: SessionDep, payload: PasswordResetConfirm):
+    invalid_token_error = HTTPException(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        detail="Invalid reset token",
+    )
+
+    reset_token = session.exec(
+        select(PasswordResetToken).where(PasswordResetToken.token == payload.token)
+    ).first()
+
+    if not reset_token:
+        raise invalid_token_error
+
+    if reset_token.used:
+        raise invalid_token_error
+
+    token_expired = reset_token.expires_at < datetime.now(UTC).replace(tzinfo=None)
+    if token_expired:
+        raise invalid_token_error
+
+    user = session.get(User, reset_token.user_id)
+    if not user:
+        raise invalid_token_error
+
+    user.hashed_password = hash_password(payload.new_password)
+    session.add(user)
+
+    reset_token.used = True
+    session.add(reset_token)
+
+    session.commit()
+
+    return {"message": "Password reset successfully"}

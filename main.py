@@ -1,7 +1,7 @@
 from contextlib import asynccontextmanager
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, FastAPI, HTTPException, status
+from fastapi import APIRouter, Body, Depends, FastAPI, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from sqlmodel import select
 
@@ -10,7 +10,8 @@ from models import User, UserCreate, UserResponse, UserUpdate
 from security import (
     DUMMY_HASH,
     create_access_token,
-    decode_access_token,
+    create_refresh_token,
+    decode_token,
     hash_password,
     verify_password,
 )
@@ -35,8 +36,11 @@ app = FastAPI(lifespan=lifespan)
 def get_current_user(
     session: SessionDep, token: Annotated[str, Depends(oauth2_scheme)]
 ):
-    payload = decode_access_token(token)
+    payload = decode_token(token)
     if not payload:
+        raise invalid_token_exception
+
+    if payload.get("type") != "access":
         raise invalid_token_exception
 
     email = payload.get("sub")
@@ -96,9 +100,41 @@ def login(
     if not verify_password(form_data.password, existing_user.hashed_password):
         raise credential_exception
 
-    access_token = create_access_token(data={"sub": existing_user.email})
+    data = {"sub": existing_user.email}
 
-    return {"access_token": access_token, "token_type": "bearer"}
+    access_token = create_access_token(data=data)
+    refresh_token = create_refresh_token(data=data)
+
+    return {
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+        "token_type": "bearer",
+    }
+
+
+@app.post("/token/refresh")
+def refresh_token(session: SessionDep, refresh_token: Annotated[str, Body(embed=True)]):
+    payload = decode_token(refresh_token)
+
+    if not payload:
+        raise invalid_token_exception
+
+    if payload.get("type") != "refresh":
+        raise invalid_token_exception
+
+    email = payload.get("sub")
+    if not email:
+        raise invalid_token_exception
+
+    user = session.exec(select(User).where(User.email == email)).first()
+    if not user:
+        raise invalid_token_exception
+
+    new_access_token = create_access_token(data={"sub": user.email})
+    return {
+        "access_token": new_access_token,
+        "token_type": "bearer",
+    }
 
 
 user_router = APIRouter(tags=["users"], dependencies=[Depends(get_current_user)])

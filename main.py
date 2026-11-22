@@ -1,7 +1,7 @@
 from contextlib import asynccontextmanager
 from typing import Annotated
 
-from fastapi import Depends, FastAPI, HTTPException, status
+from fastapi import APIRouter, Depends, FastAPI, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from sqlmodel import select
 
@@ -101,12 +101,15 @@ def login(
     return {"access_token": access_token, "token_type": "bearer"}
 
 
-@app.get("/me", status_code=status.HTTP_200_OK, response_model=UserResponse)
+user_router = APIRouter(tags=["users"], dependencies=[Depends(get_current_user)])
+
+
+@user_router.get("/me", status_code=status.HTTP_200_OK, response_model=UserResponse)
 def get_me(current_user: CurrentUser):
     return current_user
 
 
-@app.patch("/me", status_code=status.HTTP_200_OK, response_model=UserResponse)
+@user_router.patch("/me", status_code=status.HTTP_200_OK, response_model=UserResponse)
 def update_me(
     session: SessionDep, current_user: CurrentUser, update_payload: UserUpdate
 ):
@@ -131,3 +134,11 @@ def update_me(
     session.refresh(current_user)
 
     return current_user
+
+
+@user_router.get("/dashboard")
+def dashboard():
+    return {"profit": 1000000}
+
+
+app.include_router(user_router)

@@ -1,10 +1,14 @@
 import secrets
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
-from typing import Annotated
+from typing import Annotated, Literal
 
-from fastapi import APIRouter, Body, Depends, FastAPI, HTTPException, status
-from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
+from fastapi import APIRouter, Body, Depends, FastAPI, HTTPException, Security, status
+from fastapi.security import (
+    OAuth2PasswordBearer,
+    OAuth2PasswordRequestForm,
+    SecurityScopes,
+)
 from sqlmodel import select
 
 from database import SessionDep, create_db_and_tables
@@ -26,7 +30,14 @@ from security import (
     verify_password,
 )
 
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
+oauth2_scheme = OAuth2PasswordBearer(
+    tokenUrl="token",
+    scopes={
+        "read:users": "Read users",
+        "write:users": "Create and update users",
+        "delete:users": "Delete users",
+    },
+)
 
 
 @asynccontextmanager
@@ -40,7 +51,7 @@ app = FastAPI(lifespan=lifespan)
 
 def get_current_user(
     session: SessionDep, token: Annotated[str, Depends(oauth2_scheme)]
-):
+) -> User:
     invalid_token_exception = HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
         detail="Invalid token",
@@ -65,7 +76,44 @@ def get_current_user(
     return user
 
 
+def get_current_user_with_scope_check(
+    current_user: Annotated[User, Depends(get_current_user)],
+    token: Annotated[str, Depends(oauth2_scheme)],
+    security_scopes: SecurityScopes,
+) -> User:
+    payload = decode_token(token)
+    assert payload is not None
+
+    user_scopes = payload.get("scopes", [])
+
+    for scope in security_scopes.scopes:
+        if scope not in user_scopes:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Insufficient permissions",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+
+    return current_user
+
+
 CurrentUser = Annotated[User, Depends(get_current_user)]
+
+Role = Literal["user", "admin"]
+
+
+class RoleRequired:
+    def __init__(self, role: Role):
+        self.role = role
+
+    def __call__(self, current_user: CurrentUser):
+        if current_user.role != self.role:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"This action requires the '{self.role}' role",
+            )
+
+        return current_user
 
 
 @app.post("/register", status_code=status.HTTP_201_CREATED, response_model=UserResponse)
@@ -111,7 +159,7 @@ def login(
     if not verify_password(form_data.password, existing_user.hashed_password):
         raise credentials_exception
 
-    data = {"sub": existing_user.email}
+    data = {"sub": existing_user.email, "scopes": form_data.scopes}
     access_token = create_access_token(data=data)
     refresh_token = create_refresh_token(data=data)
 
@@ -185,9 +233,6 @@ def dashboard():
     return {"Profit": 1_000_000}
 
 
-app.include_router(user_router)
-
-
 @app.post("/password-reset/request")
 def request_password_reset(session: SessionDep, payload: PasswordResetRequest):
     message = {
@@ -250,3 +295,39 @@ def confirm_password_reset(session: SessionDep, payload: PasswordResetConfirm):
     session.commit()
 
     return {"message": "Password reset successfully"}
+
+
+admin_router = APIRouter(
+    prefix="/admin", dependencies=[Depends(RoleRequired("admin"))], tags=["admin"]
+)
+
+
+@admin_router.get(
+    "/users",
+    response_model=list[UserResponse],
+    dependencies=[Security(get_current_user_with_scope_check, scopes=["read:users"])],
+)
+def get_all_users(session: SessionDep):
+    return session.exec(select(User)).all()
+
+
+@admin_router.delete(
+    "/users/{user_id}",
+    response_model=UserResponse,
+    dependencies=[Security(get_current_user_with_scope_check, scopes=["delete:users"])],
+)
+def delete_user(session: SessionDep, user_id: int):
+    user = session.get(User, user_id)
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="User not found"
+        )
+
+    session.delete(user)
+    session.commit()
+
+    return user
+
+
+app.include_router(admin_router)
+app.include_router(user_router)
